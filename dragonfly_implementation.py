@@ -14,12 +14,10 @@ SAE is build upon the Dragonfly Key Exchange, which is described in https://tool
 
 https://stackoverflow.com/questions/31074172/elliptic-curve-point-addition-over-a-finite-field-in-python
 """
-
 import hashlib
 import random
 import logging
 from collections import namedtuple
-
 
 logger = logging.getLogger('dragonfly')
 logger.setLevel(logging.INFO)
@@ -49,10 +47,10 @@ def lsb(x):
 def legendre(a, p):
     return pow(a, (p - 1) // 2, p)
 
-
-# https://rosettacode.org/wiki/Tonelli-Shanks_algorithm#Python
-
 def tonelli_shanks(n, p):
+    """
+    # https://rosettacode.org/wiki/Tonelli-Shanks_algorithm#Python
+    """
     assert legendre(n, p) == 1, "not a square (mod p)"
     q = p - 1
     s = 0
@@ -85,6 +83,9 @@ def tonelli_shanks(n, p):
 class Curve():
     """
     Mathematical operations on a Elliptic Curve.
+
+    A lot of code taken from:
+    https://stackoverflow.com/questions/31074172/elliptic-curve-point-addition-over-a-finite-field-in-python
     """
 
     def __init__(self, a, b, p):
@@ -211,16 +212,16 @@ class Peer:
 
         # We currently use the elliptic curve
         # NIST P-384
-        # self.p = pow(2, 384) - pow(2, 128) - pow(2, 96) + pow(2, 32) - 1
-        # self.a = -3
-        # self.b = 27580193559959705877849011840389048093056905856361568521428707301988689241309860865136260764883745107765439761230575
-        # self.curve = Curve(self.a, self.b, self.p)
+        self.p = pow(2, 384) - pow(2, 128) - pow(2, 96) + pow(2, 32) - 1
+        self.a = -3
+        self.b = 27580193559959705877849011840389048093056905856361568521428707301988689241309860865136260764883745107765439761230575
+        self.curve = Curve(self.a, self.b, self.p)
 
         # Try out brainpoolP256t1
-        self.p = 76884956397045344220809746629001649093037950200943055203735601445031516197751
-        self.a = -3
-        self.b = 46214326585032579593829631435610129746736367449296220983687490401182983727876
-        self.curve = Curve(self.a, self.b, self.p)
+        # self.p = 76884956397045344220809746629001649093037950200943055203735601445031516197751
+        # self.a = -3
+        # self.b = 46214326585032579593829631435610129746736367449296220983687490401182983727876
+        # self.curve = Curve(self.a, self.b, self.p)
 
     def initiate(self, other_mac, k=40):
         """
@@ -229,19 +230,21 @@ class Peer:
         """
         self.other_mac = other_mac
         found = 0
+        num_valid_points = 0
         counter = 1
         n = self.p.bit_length() + 64
-        while (found == 0) and (counter <= k):
+
+        while counter <= k:
             base = self.compute_hashed_password(counter)
             temp = self.key_derivation_function(n, base, 'Dragonfly Hunting And Pecking')
-            logger.debug('temp={}'.format(temp))
             seed = (temp % (self.p - 1)) + 1
             val = self.curve.curve_equation(seed)
             if self.curve.is_quadratic_residue(val):
-                if found == 0:
+                if num_valid_points < 5:
                     x = seed
                     save = base
                     found = 1
+                    num_valid_points += 1
                     logger.info('Got point after {} iterations'.format(counter))
 
             counter = counter + 1
@@ -253,14 +256,7 @@ class Peer:
             # https://rosettacode.org/wiki/Tonelli-Shanks_algorithm
             y = tonelli_shanks(self.curve.curve_equation(x), self.p)
 
-            logger.debug('y={}'.format(y))
-            logger.debug('save={}'.format(save))
-
-            save_int = int.from_bytes(save, byteorder='little')
-            if lsb(y) == lsb(save_int):
-                PE = Point(x, y)
-            else:
-                PE = Point(x, self.p - y)
+            PE = Point(x, y)
 
             logger.info('[{}] Got Point={} after {} iterations'.format(self.name, PE, k))
             logger.info('[{}] Point is on curve: {}'.format(self.name, self.curve.valid(PE)))
@@ -318,7 +314,7 @@ class Peer:
 
         return self.scalar, self.element
 
-    def compute_shared_secret(self, peer_element, peer_scalar):
+    def compute_shared_secret(self, peer_element, peer_scalar, peer_mac):
         """
         ss = F(scalar-op(private,
                          element-op(peer-Element,
@@ -333,6 +329,10 @@ class Peer:
         the other peer’s element and scalar:
         Alice: K = rand A • (scal B • PW + elemB )
         Bob: K = rand B • (scal A • PW + elemA )
+
+        Since scal(APx) • P(x, y) is another point, the scalar multiplied point
+        of e.g. scal(AP1) • P(x, y) is added to the new_point(AP2) and afterwards
+        multiplied by private(AP1).
         """
         assert self.curve.valid(peer_element)
 
@@ -340,20 +340,27 @@ class Peer:
         # valid, they are used with the Password Element to derive a shared
         # secret, ss:
 
-        # K = self.curve.double_add_algorithm(
-        #     self.private,
-        #         self.curve.double_add_algorithm(peer_scalar,
-        #                 self.curve.ec_add(self.PE, peer_element)
-        #         )
-        # )
-        #
-        # logger.info('[{}] Shared Secret ss={}'.format(self.name, K[0]))
+        Z = self.curve.double_add_algorithm(peer_scalar, self.PE)
+        ZZ = self.curve.ec_add(peer_element, Z)
+        K = self.curve.double_add_algorithm(self.private, ZZ)
 
-        K = self.curve.double_add_algorithm(self.private,
-                         self.curve.ec_add(peer_element,
-                                    self.curve.double_add_algorithm(peer_scalar, self.PE)))
+        k = K[0]
 
-        logger.info('[{}] Shared Secret ss={}'.format(self.name, K[0]))
+        logger.info('[{}] Shared Secret ss={}'.format(self.name, k))
+
+        own_message = '{}{}{}{}{}{}'.format(k , self.scalar , peer_scalar , self.element , peer_element[0] , self.mac_address).encode()
+        peer_message = '{}{}{}{}{}{}'.format(k , peer_scalar , self.scalar , peer_element[0] , self.element , peer_mac).encode()
+
+        H = hashlib.sha256()
+        H.update(own_message)
+        self.token = H.hexdigest()
+
+        H = hashlib.sha256()
+        H.update(peer_message)
+        self.peer_token = H.hexdigest()
+
+        logger.info('[{}] Own Token={}'.format(self.name, self.token))
+        logger.info('[{}] Other Token={}'.format(self.name, self.peer_token))
 
 
     def key_derivation_function(self, n, base, seed):
@@ -425,8 +432,8 @@ def handshake():
 
     logger.info('Computing shared secret...\n')
 
-    sta.compute_shared_secret(element_ap, scalar_ap)
-    ap.compute_shared_secret(element_sta, scalar_sta)
+    sta.compute_shared_secret(element_ap, scalar_ap, mac2)
+    ap.compute_shared_secret(element_sta, scalar_sta, mac1)
 
 if __name__ == '__main__':
     handshake()
